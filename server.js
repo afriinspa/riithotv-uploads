@@ -2,8 +2,12 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { jwtVerify, createRemoteJWKSet } from 'jose';
+
+const execFileP = promisify(execFile);
 
 // Authenticated image-upload service for the RiithoTV admin.
 // Verifies the caller's Logto access token (resource = the PostgREST API, the
@@ -95,6 +99,47 @@ function decodeEntities(s) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
 }
+
+// Full catalogue via yt-dlp (no API key): the channel's Videos + Streams tabs,
+// excluding Shorts (separate tab + ≤60s safety filter). Slower than RSS but
+// returns the entire back-catalogue with durations.
+async function ytTab(channelId, tab) {
+  const url = `https://www.youtube.com/channel/${channelId}/${tab}`;
+  const { stdout } = await execFileP(
+    'yt-dlp',
+    ['--flat-playlist', '--dump-single-json', '--no-warnings', url],
+    { maxBuffer: 128 * 1024 * 1024, timeout: 150000 },
+  );
+  const data = JSON.parse(stdout);
+  return (data.entries || []).map((e) => ({
+    videoId: e.id,
+    title: e.title || e.id,
+    duration: e.duration ?? null,
+  }));
+}
+
+app.get('/youtube-catalog', requireAuth, async (req, res) => {
+  const channelId = String(req.query.channel || YT_CHANNEL_ID || '').trim();
+  if (!/^UC[\w-]{22}$/.test(channelId)) return res.status(400).json({ error: 'bad_channel' });
+  try {
+    const [videos, streams] = await Promise.all([
+      ytTab(channelId, 'videos').catch(() => []),
+      ytTab(channelId, 'streams').catch(() => []),
+    ]);
+    const seen = new Set();
+    const all = [];
+    for (const v of [...videos, ...streams]) {
+      if (!v.videoId || seen.has(v.videoId)) continue;
+      if (v.duration != null && v.duration <= 60) continue; // exclude Shorts
+      seen.add(v.videoId);
+      all.push(v);
+    }
+    res.json({ count: all.length, videos: all });
+  } catch (err) {
+    console.error('yt-dlp catalog failed:', err?.message);
+    res.status(502).json({ error: 'catalog_failed' });
+  }
+});
 
 app.get('/youtube-feed', requireAuth, async (req, res) => {
   const channelId = String(req.query.channel || YT_CHANNEL_ID || '').trim();
