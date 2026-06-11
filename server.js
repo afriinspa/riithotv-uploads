@@ -81,6 +81,51 @@ app.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   }
 });
 
+// --- YouTube channel feed (public RSS, no API key) ---
+// Returns the latest uploads for a public channel so the admin "Update Videos"
+// button can import new videos as episodes. Browsers can't fetch YouTube's
+// feed (CORS), so we proxy + parse it here.
+const YT_CHANNEL_ID = process.env.YT_CHANNEL_ID || '';
+
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+app.get('/youtube-feed', requireAuth, async (req, res) => {
+  const channelId = String(req.query.channel || YT_CHANNEL_ID || '').trim();
+  if (!/^UC[\w-]{22}$/.test(channelId)) return res.status(400).json({ error: 'bad_channel' });
+  try {
+    const r = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`);
+    if (!r.ok) return res.status(502).json({ error: 'feed_fetch_failed', status: r.status });
+    const xml = await r.text();
+    const videos = xml
+      .split('<entry>')
+      .slice(1)
+      .map((block) => {
+        const vid = (block.match(/<yt:videoId>([^<]+)<\/yt:videoId>/) || [])[1];
+        if (!vid) return null;
+        const title = (block.match(/<title>([^<]*)<\/title>/) || [])[1];
+        const pub = (block.match(/<published>([^<]+)<\/published>/) || [])[1];
+        return {
+          videoId: vid,
+          title: title ? decodeEntities(title) : vid,
+          publishedAt: pub || null,
+          thumbnail: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+        };
+      })
+      .filter(Boolean);
+    const channelTitle = decodeEntities((xml.match(/<title>([^<]*)<\/title>/) || [])[1] || '');
+    res.json({ channel: channelTitle, channelId, videos });
+  } catch {
+    res.status(502).json({ error: 'feed_error' });
+  }
+});
+
 // multer file-size errors → 413
 app.use((err, _req, res, _next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'too_large' });
